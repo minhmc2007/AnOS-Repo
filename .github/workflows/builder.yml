@@ -20,35 +20,36 @@ jobs:
 
       - name: Setup Arch Linux Environment & Install Flutter
         run: |
-          # Initialize pacman keyring
+          # 1. Initialize pacman keyring
           pacman-key --init
           pacman-key --populate
           
-          # Install base dependencies PLUS Flutter Linux build requirements
+          # 2. Install base dependencies PLUS Flutter Linux build requirements
           pacman -Syu --noconfirm base-devel git sudo jq curl clang cmake ninja pkgconf gtk3
           
-          # ------------------------------------------------------------------
-          # FIX 1: Disable debug package generation globally in Arch
-          # This prevents those unwanted flutter -debug packages from generating
-          # ------------------------------------------------------------------
-          sed -i 's/debug/!debug/g' /etc/makepkg.conf
+          # 3. Disable debug package generation globally (prevents unwanted -debug packages)
+          sed -i 's/\bdebug\b/!debug/g' /etc/makepkg.conf
           sed -i 's/!!debug/!debug/g' /etc/makepkg.conf
           
-          # Create a non-root user for makepkg and yay
+          # 4. Create a non-root user for makepkg and yay
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           
-          # Fix workspace ownership so the builder user can read/write to the checked-out code
+          # 5. Fix workspace ownership so the builder user can read/write to the checked-out code
           chown -R builder:builder $GITHUB_WORKSPACE
+          git config --global --add safe.directory '*'
+          su - builder -c "git config --global --add safe.directory '*'"
           
-          # Install yay (AUR Helper)
+          # 6. Install yay (AUR Helper) - RUN AS BUILDER
           su - builder -c "git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin && cd /tmp/yay-bin && makepkg -si --noconfirm"
           
-          # Install flutter-bin via yay
+          # 7. Install flutter-bin via yay - RUN AS BUILDER
           su - builder -c "yay -S --noconfirm flutter-bin"
           
-          # Workaround for Git security restrictions in Actions
-          su - builder -c "git config --global --add safe.directory $GITHUB_WORKSPACE"
+          # 8. Grant the builder user permissions to run Flutter build commands
+          usermod -aG flutter builder
+          chown -R root:flutter /opt/flutter || true
+          chmod -R g+w /opt/flutter || true
 
       - name: Build Packages and Generate Repo
         id: build
@@ -57,32 +58,31 @@ jobs:
         run: |
           START_TIME=$(date +%s)
           
-          # 1. Determine Trigger Type
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          # Check Trigger Type (Syntax Fixed)
+          if[ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             TRIGGER="Manual"
           else
             TRIGGER="Auto"
           fi
           
-          # 2. Setup tmp folder for final packages
+          # Setup tmp folder for final packages
           TMP_DIR="$GITHUB_WORKSPACE/tmp_repo"
           mkdir -p "$TMP_DIR"
-          chown -R builder:builder "$TMP_DIR"
           
           PACKAGE_NAMES=""
           PACKAGE_SIZES=""
           
-          # 3. Iterate through src/ folder dynamically
+          # Iterate through src/ folder dynamically
           cd "$GITHUB_WORKSPACE/src/" || exit 0
           
           for d in */; do
-            # ------------------------------------------------------------------
-            # FIX 2: We MUST return to the base src/ directory at the start 
-            # of every loop so the script doesn't get lost in the previous folder!
-            # ------------------------------------------------------------------
+            # Return to the base src/ directory at the start of every loop
             cd "$GITHUB_WORKSPACE/src/"
             
-            [ -d "$d" ] || continue
+            if[ ! -d "$d" ]; then
+              continue
+            fi
+            
             dir_name=${d%/}
             echo "================================================="
             echo "Processing project: $dir_name"
@@ -93,14 +93,13 @@ jobs:
             if [ -f "PKGBUILD" ]; then
               echo "Found PKGBUILD. Compiling directly via makepkg..."
               
-              # Added '-i' to automatically install the built package to the system.
-              # This ensures that if another package in your repo depends on this one, it works!
+              # RUN AS BUILDER: makepkg securely
               set +e
               su - builder -c "cd $GITHUB_WORKSPACE/src/$dir_name && makepkg -si --noconfirm"
               BUILD_STATUS=$?
               set -e
               
-              if [ $BUILD_STATUS -ne 0 ]; then
+              if[ $BUILD_STATUS -ne 0 ]; then
                 echo "::error::Failed to build $dir_name. Skipping to next package..."
                 continue
               fi
@@ -108,7 +107,8 @@ jobs:
               # Copy outputs to our temp repo directory
               cp *.pkg.tar.* "$TMP_DIR/" 2>/dev/null || true
               
-              for pkg in *.pkg.tar.*; do[ -e "$pkg" ] || continue
+              for pkg in *.pkg.tar.*; do
+                if [ ! -e "$pkg" ]; then continue; fi
                 filename=$(basename "$pkg")
                 PACKAGE_NAMES="${PACKAGE_NAMES}\n- ${filename}"
                 SIZE=$(du -h "$pkg" | cut -f1)
@@ -119,6 +119,7 @@ jobs:
               echo "Found dist/build.sh. Running custom build script..."
               chmod +x dist/build.sh
               
+              # RUN AS BUILDER: Execute your custom flutter script securely
               set +e
               su - builder -c "cd $GITHUB_WORKSPACE/src/$dir_name && ./dist/build.sh"
               BUILD_STATUS=$?
@@ -132,10 +133,11 @@ jobs:
               # Install it via pacman just in case a subsequent package depends on it
               su - builder -c "sudo pacman -U --noconfirm dist/pkg/*.pkg.tar.* 2>/dev/null || true"
               
-              # Copy from dist/pkg as requested
+              # Copy from your script's dist/pkg folder directly
               cp dist/pkg/*.pkg.tar.* "$TMP_DIR/" 2>/dev/null || true
               
-              for pkg in dist/pkg/*.pkg.tar.*; do[ -e "$pkg" ] || continue
+              for pkg in dist/pkg/*.pkg.tar.*; do
+                if [ ! -e "$pkg" ]; then continue; fi
                 filename=$(basename "$pkg")
                 PACKAGE_NAMES="${PACKAGE_NAMES}\n- ${filename}"
                 SIZE=$(du -h "$pkg" | cut -f1)
@@ -146,27 +148,29 @@ jobs:
             fi
           done
           
-          # 4. Generate the 'anos' Pacman Repository (No PGP)
+          # Generate the 'anos' Pacman Repository
           echo "Generating anos pacman repo..."
           cd "$TMP_DIR"
-          # Ensure builder user owns the newly copied packages before running repo-add
+          
+          # Hand ownership of the copied packages back to builder before running repo-add
           chown -R builder:builder "$TMP_DIR"
           
+          # RUN AS BUILDER: Generate the DB
           if ls *.pkg.tar.* >/dev/null 2>&1; then
             su - builder -c "cd $TMP_DIR && repo-add anos.db.tar.gz *.pkg.tar.*"
           else
             echo "::warning::No packages were built!"
           fi
           
-          # 5. Calculate Metrics
+          # Calculate Metrics
           END_TIME=$(date +%s)
           TOTAL_TIME=$((END_TIME - START_TIME))
           TOTAL_MIN=$((TOTAL_TIME / 60))
           TOTAL_SEC=$((TOTAL_TIME % 60))
           CURRENT_DATE=$(date +"%Y-%m-%d %H:%M:%S UTC")
           
-          # 6. Generate Unique Random Release Tag
-          PREV_TAG=$(curl -s -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name)
+          # Generate Unique Random Release Tag
+          PREV_TAG=$(curl -s -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name || echo "none")
           while true; do
             NEW_TAG="$RANDOM$RANDOM"
             if[ "$NEW_TAG" != "$PREV_TAG" ]; then
@@ -176,7 +180,7 @@ jobs:
           
           echo "RELEASE_TAG=$NEW_TAG" >> $GITHUB_ENV
           
-          # 7. Format Release Markdown Message
+          # Format Release Markdown Message
           {
             echo "## Anos Repository Build"
             echo "**Trigger:** $TRIGGER"
@@ -184,10 +188,10 @@ jobs:
             echo "**Total Time Taken:** ${TOTAL_MIN}m ${TOTAL_SEC}s"
             echo ""
             echo "### Built Packages"
-            if [ -z "$PACKAGE_NAMES" ]; then echo "- No packages built"; else echo -e "$PACKAGE_NAMES"; fi
+            if[ -z "$PACKAGE_NAMES" ]; then echo "- No packages built"; else echo -e "$PACKAGE_NAMES"; fi
             echo ""
             echo "### Package Sizes"
-            if[ -z "$PACKAGE_SIZES" ]; then echo "- N/A"; else echo -e "$PACKAGE_SIZES"; fi
+            if [ -z "$PACKAGE_SIZES" ]; then echo "- N/A"; else echo -e "$PACKAGE_SIZES"; fi
           } > $GITHUB_WORKSPACE/release_notes.md
 
       - name: Publish GitHub Release
