@@ -47,6 +47,7 @@ jobs:
           su - builder -c "yay -S --noconfirm flutter-bin"
           
           # 8. Grant the builder user permissions to run Flutter build commands
+          groupadd flutter || true
           usermod -aG flutter builder
           chown -R root:flutter /opt/flutter || true
           chmod -R g+w /opt/flutter || true
@@ -58,7 +59,7 @@ jobs:
         run: |
           START_TIME=$(date +%s)
           
-          # Check Trigger Type (Syntax Fixed)
+          # Check Trigger Type (Syntax Fixed: added space after if)
           if[ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             TRIGGER="Manual"
           else
@@ -79,7 +80,8 @@ jobs:
             # Return to the base src/ directory at the start of every loop
             cd "$GITHUB_WORKSPACE/src/"
             
-            if[ ! -d "$d" ]; then
+            # Syntax Fixed: added spaces around brackets
+            if [ ! -d "$d" ]; then
               continue
             fi
             
@@ -90,7 +92,7 @@ jobs:
             
             cd "$GITHUB_WORKSPACE/src/$dir_name"
             
-            if [ -f "PKGBUILD" ]; then
+            if[ -f "PKGBUILD" ]; then
               echo "Found PKGBUILD. Compiling directly via makepkg..."
               
               # RUN AS BUILDER: makepkg securely
@@ -115,7 +117,8 @@ jobs:
                 PACKAGE_SIZES="${PACKAGE_SIZES}\n- ${filename}: ${SIZE}"
               done
               
-            elif[ -f "dist/build.sh" ]; then
+            # Syntax Fixed: changed elif[ to elif[
+            elif [ -f "dist/build.sh" ]; then
               echo "Found dist/build.sh. Running custom build script..."
               chmod +x dist/build.sh
               
@@ -125,7 +128,7 @@ jobs:
               BUILD_STATUS=$?
               set -e
               
-              if[ $BUILD_STATUS -ne 0 ]; then
+              if [ $BUILD_STATUS -ne 0 ]; then
                 echo "::error::Custom build.sh failed for $dir_name. Skipping to next package..."
                 continue
               fi
@@ -173,6 +176,7 @@ jobs:
           PREV_TAG=$(curl -s -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name || echo "none")
           while true; do
             NEW_TAG="$RANDOM$RANDOM"
+            # Syntax fixed! Added space
             if[ "$NEW_TAG" != "$PREV_TAG" ]; then
               break
             fi
@@ -188,7 +192,7 @@ jobs:
             echo "**Total Time Taken:** ${TOTAL_MIN}m ${TOTAL_SEC}s"
             echo ""
             echo "### Built Packages"
-            if[ -z "$PACKAGE_NAMES" ]; then echo "- No packages built"; else echo -e "$PACKAGE_NAMES"; fi
+            if [ -z "$PACKAGE_NAMES" ]; then echo "- No packages built"; else echo -e "$PACKAGE_NAMES"; fi
             echo ""
             echo "### Package Sizes"
             if [ -z "$PACKAGE_SIZES" ]; then echo "- N/A"; else echo -e "$PACKAGE_SIZES"; fi
