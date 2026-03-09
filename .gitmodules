@@ -1,0 +1,3 @@
+[submodule "src/fcitx5-lotus-bin"]
+	path = src/fcitx5-lotus-bin
+	url = https://aur.archlinux.org/fcitx5-lotus-bin.git
