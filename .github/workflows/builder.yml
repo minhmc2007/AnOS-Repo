@@ -27,6 +27,13 @@ jobs:
           # Install base dependencies PLUS Flutter Linux build requirements
           pacman -Syu --noconfirm base-devel git sudo jq curl clang cmake ninja pkgconf gtk3
           
+          # ------------------------------------------------------------------
+          # FIX 1: Disable debug package generation globally in Arch
+          # This prevents those unwanted flutter -debug packages from generating
+          # ------------------------------------------------------------------
+          sed -i 's/debug/!debug/g' /etc/makepkg.conf
+          sed -i 's/!!debug/!debug/g' /etc/makepkg.conf
+          
           # Create a non-root user for makepkg and yay
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
@@ -65,49 +72,77 @@ jobs:
           PACKAGE_NAMES=""
           PACKAGE_SIZES=""
           
-          # 3. Iterate through src/ folder
-          cd $GITHUB_WORKSPACE/src/ || exit 0
+          # 3. Iterate through src/ folder dynamically
+          cd "$GITHUB_WORKSPACE/src/" || exit 0
           
           for d in */; do
+            # ------------------------------------------------------------------
+            # FIX 2: We MUST return to the base src/ directory at the start 
+            # of every loop so the script doesn't get lost in the previous folder!
+            # ------------------------------------------------------------------
+            cd "$GITHUB_WORKSPACE/src/"
+            
             [ -d "$d" ] || continue
             dir_name=${d%/}
+            echo "================================================="
             echo "Processing project: $dir_name"
+            echo "================================================="
             
             cd "$GITHUB_WORKSPACE/src/$dir_name"
             
             if [ -f "PKGBUILD" ]; then
               echo "Found PKGBUILD. Compiling directly via makepkg..."
-              su - builder -c "cd $GITHUB_WORKSPACE/src/$dir_name && makepkg -s --noconfirm"
+              
+              # Added '-i' to automatically install the built package to the system.
+              # This ensures that if another package in your repo depends on this one, it works!
+              set +e
+              su - builder -c "cd $GITHUB_WORKSPACE/src/$dir_name && makepkg -si --noconfirm"
+              BUILD_STATUS=$?
+              set -e
+              
+              if [ $BUILD_STATUS -ne 0 ]; then
+                echo "::error::Failed to build $dir_name. Skipping to next package..."
+                continue
+              fi
               
               # Copy outputs to our temp repo directory
-              cp *.pkg.tar.zst "$TMP_DIR/" 2>/dev/null || true
+              cp *.pkg.tar.* "$TMP_DIR/" 2>/dev/null || true
               
-              for pkg in *.pkg.tar.zst; do
-                [ -e "$pkg" ] || continue
+              for pkg in *.pkg.tar.*; do[ -e "$pkg" ] || continue
                 filename=$(basename "$pkg")
                 PACKAGE_NAMES="${PACKAGE_NAMES}\n- ${filename}"
                 SIZE=$(du -h "$pkg" | cut -f1)
                 PACKAGE_SIZES="${PACKAGE_SIZES}\n- ${filename}: ${SIZE}"
               done
               
-            elif [ -f "dist/build.sh" ]; then
+            elif[ -f "dist/build.sh" ]; then
               echo "Found dist/build.sh. Running custom build script..."
               chmod +x dist/build.sh
               
+              set +e
               su - builder -c "cd $GITHUB_WORKSPACE/src/$dir_name && ./dist/build.sh"
+              BUILD_STATUS=$?
+              set -e
+              
+              if[ $BUILD_STATUS -ne 0 ]; then
+                echo "::error::Custom build.sh failed for $dir_name. Skipping to next package..."
+                continue
+              fi
+              
+              # Install it via pacman just in case a subsequent package depends on it
+              su - builder -c "sudo pacman -U --noconfirm dist/pkg/*.pkg.tar.* 2>/dev/null || true"
               
               # Copy from dist/pkg as requested
-              cp dist/pkg/*.pkg.tar.zst "$TMP_DIR/" 2>/dev/null || true
+              cp dist/pkg/*.pkg.tar.* "$TMP_DIR/" 2>/dev/null || true
               
-              for pkg in dist/pkg/*.pkg.tar.zst; do
-                [ -e "$pkg" ] || continue
+              for pkg in dist/pkg/*.pkg.tar.*; do[ -e "$pkg" ] || continue
                 filename=$(basename "$pkg")
                 PACKAGE_NAMES="${PACKAGE_NAMES}\n- ${filename}"
                 SIZE=$(du -h "$pkg" | cut -f1)
                 PACKAGE_SIZES="${PACKAGE_SIZES}\n- ${filename}: ${SIZE}"
               done
             else
-              echo "Skipping $dir_name: Neither PKGBUILD nor dist/build.sh found."
+              echo "::warning::Skipping $dir_name: Neither PKGBUILD nor dist/build.sh found."
             fi
           done
           
@@ -117,10 +152,10 @@ jobs:
           # Ensure builder user owns the newly copied packages before running repo-add
           chown -R builder:builder "$TMP_DIR"
           
-          if ls *.pkg.tar.zst >/dev/null 2>&1; then
-            su - builder -c "cd $TMP_DIR && repo-add anos.db.tar.gz *.pkg.tar.zst"
+          if ls *.pkg.tar.* >/dev/null 2>&1; then
+            su - builder -c "cd $TMP_DIR && repo-add anos.db.tar.gz *.pkg.tar.*"
           else
-            echo "WARNING: No packages were built!"
+            echo "::warning::No packages were built!"
           fi
           
           # 5. Calculate Metrics
@@ -130,11 +165,11 @@ jobs:
           TOTAL_SEC=$((TOTAL_TIME % 60))
           CURRENT_DATE=$(date +"%Y-%m-%d %H:%M:%S UTC")
           
-          # 6. Generate Unique Random Release Tag (Preventing Match with Previous)
+          # 6. Generate Unique Random Release Tag
           PREV_TAG=$(curl -s -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name)
           while true; do
             NEW_TAG="$RANDOM$RANDOM"
-            if [ "$NEW_TAG" != "$PREV_TAG" ]; then
+            if[ "$NEW_TAG" != "$PREV_TAG" ]; then
               break
             fi
           done
@@ -152,7 +187,7 @@ jobs:
             if [ -z "$PACKAGE_NAMES" ]; then echo "- No packages built"; else echo -e "$PACKAGE_NAMES"; fi
             echo ""
             echo "### Package Sizes"
-            if [ -z "$PACKAGE_SIZES" ]; then echo "- N/A"; else echo -e "$PACKAGE_SIZES"; fi
+            if[ -z "$PACKAGE_SIZES" ]; then echo "- N/A"; else echo -e "$PACKAGE_SIZES"; fi
           } > $GITHUB_WORKSPACE/release_notes.md
 
       - name: Publish GitHub Release
